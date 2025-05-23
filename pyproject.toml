@@ -27,6 +27,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
+  "construct>=2.10.70",
+  "prompt-toolkit>=3.0.51",
   "pyusb",
 ]
 
