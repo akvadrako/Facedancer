@@ -99,12 +99,8 @@ export BACKEND=greatfet
  * The CCCamp 2015 rad1o badge with GreatFET l0adable (```BACKEND=greatfet```)
  * All GoodFET-based Facedancers, including the common Facedancer21 (```BACKEND=goodfet```)
  * RPi + Max3241 Raspdancer boards (```BACKEND=raspdancer```)
-<<<<<<< HEAD
  * HydraDancer and HydraUSB3 boards (```BACKEND=hydradancer```)
-||||||| 2aca8e6
-=======
  * Any Linux board with Raw Gadget support (```BACKEND=rawgadget```)
->>>>>>> rawgadget
 
 Note that hardware restrictions prevent the MAX3420/MAX3421 boards from emulating
 more complex devices -- there's limitation on the number/type of endpoints that can be
