@@ -9,9 +9,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import errno
 import fcntl
 import os
+from threading import Thread
+
+from queue import Queue
 
 from construct import (
     Bit,
@@ -31,8 +35,14 @@ from construct import (
 )
 
 from facedancer.device import USBDevice
+from facedancer.endpoint import USBEndpoint
 from facedancer.request import USBControlRequest
-from facedancer.types import DeviceSpeed, USBDirection
+from facedancer.types import (
+    DeviceSpeed,
+    USBDirection,
+    USBRequestRecipient,
+    USBStandardRequests,
+)
 from facedancer.core import FacedancerApp
 
 from ..logging import log
@@ -42,13 +52,16 @@ from .base import FacedancerBackend
 class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     app_name = "Raw Gadget"
 
+    device: RawGadget
     connected_device: USBDevice
+    queue: Queue
+    eps: dict[int, EndpointHandler]
 
     def __init__(
         self,
         device: RawGadget | None = None,
         verbose: int = 0,
-        quirks = None
+        quirks=None,
     ):
         """
         Initializes the backend.
@@ -58,21 +71,16 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             verbose : The verbosity level of the given application. (Optional)
             quirks  : List of USB platform quirks.                  (Optional)
         """
-        super().__init__(device or RawGadget(), verbose)
+        super().__init__(device or RawGadget(verbose), verbose)
 
-        self.enabled_eps = {}
+        self.queue = Queue(100)
+        self.eps = {}
         self.eps_info = None
         self.connected_device = None
         self.is_configured = False
         self.is_suspended = False
 
         self.device.open()
-        # Set a small timeout for event fetching, as it only checks a Raw Gadget
-        # internal queue for events and does no USB communication.
-        self.device.set_timeout(usb_raw_timeout_type.USB_RAW_TIMEOUT_EVENT_FETCH, 0, 20)
-        # Set a larger timeout for endpoint operations here and in configured,
-        # as these operations do USB communication.
-        self.device.set_timeout(usb_raw_timeout_type.USB_RAW_TIMEOUT_EP0_IO, 0, 100)
 
     @classmethod
     def appropriate_for_environment(cls, backend_name: str | None) -> bool:
@@ -118,28 +126,28 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             max_packet_size_ep0 : Max packet size for control endpoint.
             device_speed : Requested usb speed for the Facedancer board.
         """
+        if self.verbose > 0:
+            log.info("connecting device: %s (%r)", usb_device.name, device_speed)
+
         self.connected_device = usb_device
         self.device.run(speed=device_speed)
-
-        if self.verbose > 0:
-            print(self.app_name, "connected device", self.connected_device.name)
+        self.control = ControlHandler(self)
 
     def disconnect(self):
         """Disconnects Facedancer from the target host."""
         assert self.connected_device
+        self._disable()
+        self.control.stop()
         self.device.close()
 
         if self.verbose > 0:
-            print(self.app_name, "disconnected device", self.connected_device.name)
+            log.info("disconnected device: %s", self.connected_device.name)
 
         self.connected_device = None
 
     def reset(self):
-        """
-        Triggers the Facedancer to handle its side of a bus reset.
-        """
-        # Raw Gadget does not yet support resetting the device.
-        raise NotImplementedError
+        """Does nothing since gadgets cannot initiate device-side resets."""
+        log.info("ignoring reset request")
 
     def set_address(self, address: int, defer: bool = False):
         """
@@ -163,26 +171,10 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             configuration : The USBConfiguration object applied by the SET_CONFIG request.
         """
+        log.info("applying configuration")
         self.validate_configuration(configuration)
-        for ep in self.enabled_eps:
-            self.device.ep_disable(self.enabled_eps[ep])
-        self.enabled_eps = {}
 
-        for interface in configuration.get_interfaces():
-            for ep in interface.get_endpoints():
-                # We could validate the endpoint descriptor against the UDC
-                # endpoint capabilities and the selected USB device speed.
-                # This will, however, limit the ability to emulate devices
-                # that do not strictly follow the USB specifications;
-                # some UDCs unofficially support this. As having this ability
-                # might be useful for fuzzing, use the endpoint descriptor as
-                # is. As a trade off, this might lead to unpredictable errors
-                # during the device emulation.
-                ep_handle = self.device.ep_enable(ep.get_descriptor())
-                self.device.set_timeout(
-                    usb_raw_timeout_type.USB_RAW_TIMEOUT_EP_IO, ep_handle, 100
-                )
-                self.enabled_eps[ep.get_address()] = ep_handle
+        self._disable()
 
         self.device.vbus_draw(configuration.max_power // 2)
         self.device.configure()
@@ -190,7 +182,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.configuration = configuration
         self.is_configured = True
 
-        log.info("configured")
+        self._enable()
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
         """
@@ -199,46 +191,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             endpoint_number : The number of the OUT endpoint on which data is to be rx'd.
         """
-        if endpoint_number != 1:
-            return b""
-
-        byte_count = self.read_register(self.reg_ep1_out_byte_count)
-        if byte_count == 0:
-            return b""
-
-        data = self.read_bytes(self.reg_ep1_out_fifo, byte_count)
-
-        if self.verbose > 1:
-            print(
-                self.app_name,
-                "read",
-                self.bytes_as_hex(data),
-                "from endpoint",
-                endpoint_number,
-            )
-
-        return data
-
-    def send_on_control_endpoint(
-        self,
-        endpoint_number: int,
-        in_request: USBControlRequest,
-        data: bytes,
-        blocking: bool = True,
-    ):
-        """
-        Sends a collection of USB data in response to a IN control request by the host.
-
-        Args:
-            endpoint_number  : The number of the IN endpoint on which data should be sent.
-            in_request       : The control request being responded to.
-            data             : The data to be sent.
-            blocking         : If true, this function should wait for the transfer to complete.
-        """
-        # Truncate data to requested length and forward to `send_on_endpoint()` for backends
-        # that do not need to support this method.
-        return self.send_on_endpoint(
-            endpoint_number, data[: in_request.length], blocking
+        raise NotImplementedError(
+            "read_from_endpoint happens automatically in background"
         )
 
     def send_on_endpoint(
@@ -252,22 +206,17 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             data : The data to be sent.
             blocking : If true, this function should wait for the transfer to complete.
         """
-        # Here and in ack_status_stage, Raw Gadget backend ignores the blocking
-        # argument, as it does not support non-blocking transfers. Instead,
-        # this backend relies on timeouts.
-        if self.verbose > 1:
-            log.info(
-                f"send_on_endpoint: {endpoint_number=} {len(data)=:0x} {blocking=}"
-            )
 
         if endpoint_number == 0:
-            if self.last_control_direction == USBDirection.OUT:
-                self.device.ep0_read(bytes(data))
-            else:
-                self.device.ep0_write(bytes(data))
+            if self.verbose > 2:
+                log.info(
+                    f"send control dir={self.last_control_direction} len={len(data)} {blocking=}"
+                )
+            self.control.send(data, self.last_control_direction, blocking)
         else:
-            ep_addr = self._endpoint_address(endpoint_number, USBDirection.IN)
-            self.device.ep_write(self.enabled_eps[ep_addr], bytes(data))
+            handler = self.eps[endpoint_number]
+            assert isinstance(handler, EndpointInHandler)
+            handler.send(data, blocking)
 
     def ack_status_stage(
         self,
@@ -287,13 +236,17 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             blocking : True if we should wait for the ACK to be fully issued
                        before returning.
         """
-        log.info(f"ack_status_stage: {direction=} {endpoint_number=} {blocking=}")
+        acked = self.last_control_acked
+        log.info(
+            f"ack_status_stage {acked=} {direction.name} {endpoint_number=} {blocking=}"
+        )
+        if acked:
+            return
+
         if endpoint_number != 0:
             raise NotImplementedError()
-        if direction == USBDirection.OUT:
-            self.device.ep0_read(bytes([]))
-        else:
-            self.device.ep0_write(bytes([]))
+
+        self.control.send(b"", direction, blocking)
 
     def stall_endpoint(
         self, endpoint_number: int, direction: USBDirection = USBDirection.OUT
@@ -305,7 +258,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             endpoint_number : The number of the endpoint to be stalled.
         """
         if self.verbose > 0:
-            print(self.app_name, "stalling endpoint {}".format(endpoint_number))
+            log.info(f"stall endpoint={endpoint_number} {direction.name}")
 
         if endpoint_number == 0:
             self.device.ep0_stall()
@@ -317,111 +270,107 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
     def service_irqs(self):
         """
-        Core routine of the Facedancer execution/event loop. Continuously monitors the
-        Facedancer's execution status, and reacts as events occur.
+        Core event loop - reacts to events from the host via the rawgadget API.
         """
-        event = self.device.event_fetch(bytes(usb_ctrlrequest.sizeof()))
-        if event is not None:
-            if event.type == usb_raw_event_type.USB_RAW_EVENT_CONNECT:
+        event = self.queue.get()
+        match event:
+            case RawGadgetEvent(kind, data):
+                self._handle_raw_gadget_event(kind, data)
+            case EpReadEvent(ep, data):
+                self.connected_device.handle_data_received(ep, data)
+            case _:
+                assert False
+
+    ##############################################################################
+    # Internal functions
+
+    def _handle_raw_gadget_event(self, kind, data):
+        if self.verbose > 2:
+            log.debug(f"recv event {kind} len={len(data)}")
+
+        match kind:
+            case usb_raw_event_type.USB_RAW_EVENT_CONNECT:
                 # UDC endpoint information is only obtained for reference:
                 # this backend does use it in any way. In the future, this
                 # backend can be extended to validate UDC endpoints
                 # capabilities against the device endpoint descriptors.
                 self.eps_info = self.device.eps_info()
-            elif event.type == usb_raw_event_type.USB_RAW_EVENT_CONTROL:
-                request = self.connected_device.create_request(event.data)
-                self.last_control_direction = request.get_direction()
-                self.connected_device.handle_request(request)
-            elif event.type == usb_raw_event_type.USB_RAW_EVENT_DISCONNECT:
+            case usb_raw_event_type.USB_RAW_EVENT_CONTROL:
+                self._recv_control(data)
+            case usb_raw_event_type.USB_RAW_EVENT_DISCONNECT:
                 # For an unclear reason, some UDC drivers issue a disconnect
                 # event when the device is being reconfigured. Thus, treat
                 # disconnect as reset.
-                self.is_configured = False
-                log.info("gadget disconnected")
-            elif event.type == usb_raw_event_type.USB_RAW_EVENT_SUSPEND:
-                self.is_suspended = True
+                log.info("gadget disable")
+                self._reset()
+            case usb_raw_event_type.USB_RAW_EVENT_SUSPEND:
                 log.info("gadget suspended")
-            elif event.type == usb_raw_event_type.USB_RAW_EVENT_RESET:
-                self.is_configured = False
+                self.is_suspended = True
+            case usb_raw_event_type.USB_RAW_EVENT_RESET:
                 log.info("gadget reset")
-            elif event.type == usb_raw_event_type.USB_RAW_EVENT_RESUME:
+                self._reset()
+            case usb_raw_event_type.USB_RAW_EVENT_RESUME:
                 self.is_suspended = False
                 log.info("gadget resumed")
-            else:
+            case _:
                 # Raw Gadget might be extended and start reporting other kinds
                 # of events. Instead of ignoring these events, raise an
                 # exception to hint that this backend must be extended as well.
                 raise NotImplementedError()
 
-        if not (self.is_configured) or self.is_suspended:
+    def _recv_control(self, data: bytes):
+        req: USBControlRequest = self.connected_device.create_request(data)
+
+        if self.verbose > 2:
+            log.debug(f"recv control {req}")
+
+        self.last_control_direction = req.get_direction()
+        self.last_control_acked = False
+
+        if req.direction == USBDirection.OUT and req.length != 0:
+            rv, ep_request = self.device.ep0_read(bytearray(req.length))
+            assert ep_request and rv == req.length
+            req.data = bytes(ep_request.data)
+            self.last_control_acked = True
+
+        reenable = False
+        if (
+            req.get_recipient() == USBRequestRecipient.INTERFACE
+            and req.request == USBStandardRequests.SET_INTERFACE
+        ):
+            log.info(f"gadget set interface {req.index} alt {req.value}")
+            reenable = True
+
+        if reenable:
+            self._disable()
+
+        self.connected_device.handle_request(req)
+
+        if reenable:
+            self._enable()
+
+    def _reset(self):
+        self.is_configured = False
+        self._disable()
+        if self.connected_device:
+            self.connected_device.handle_bus_reset()
+
+    def _enable(self):
+        if not self.is_configured:
             return
 
-        for ep_addr in self.enabled_eps:
-            ep_dir = self._endpoint_direction(ep_addr)
-            endpoint_number = self._endpoint_number(ep_addr)
-            ep = self._get_endpoint(ep_addr)
+        for interface in self.configuration.get_interfaces():
+            for ep in interface.get_endpoints():
+                if ep.direction == USBDirection.IN:
+                    self.eps[ep.number] = EndpointInHandler(ep, self)
+                else:
+                    self.eps[ep.number] = EndpointOutHandler(ep, self)
 
-            if ep_dir == USBDirection.IN:
-                try:
-                    # Try future API.
-                    self.connected_device.handle_data_requested(ep)
-                except AttributeError:
-                    # Fall back to legacy API.
-                    self.connected_device.handle_buffer_available(endpoint_number)
-            else:
-                data = self._read_from_endpoint(ep_addr, bytes(ep.max_packet_size))
-                if data is not None:
-                    try:
-                        # Try future API.
-                        self.connected_device.handle_data_received(ep, data)
-                    except AttributeError:
-                        # Fall back to legacy API.
-                        self.connected_device.handle_data_available(ep_addr, data)
+    def _disable(self):
+        for ep in self.eps.values():
+            ep.stop()
 
-    ##############################################################################
-    # Internal functions
-
-    def _read_from_endpoint(self, ep_addr, data):
-        rv, data = self.device.ep_read(self.enabled_eps[ep_addr], bytes(data))
-        if rv is None:
-            return None
-        return usb_raw_ep_io.parse(data).data
-
-    @staticmethod
-    def _endpoint_address(endpoint_number, direction):
-        if direction:
-            return endpoint_number | 0x80
-        else:
-            return endpoint_number
-
-    @staticmethod
-    def _endpoint_number(ep_addr):
-        return ep_addr & 0x7F
-
-    @staticmethod
-    def _endpoint_direction(ep_addr):
-        return ep_addr >> 7
-
-    def _get_endpoint(self, ep_addr):
-        try:
-            # Try future API.
-            endpoint_number = self._endpoint_number(ep_addr)
-            ep_dir = self._endpoint_direction(ep_addr)
-            return self.connected_device.get_endpoint(endpoint_number, ep_dir)
-        except AttributeError:
-            # Fall back to legacy API.
-            for interface in self.connected_device.configuration.get_interfaces():
-                for ep in interface.get_endpoints():
-                    if ep.get_address() == ep_addr:
-                        return ep
-        return None
-
-    @staticmethod
-    def bytes_as_hex(b, delim=" "):
-        return delim.join(["%02x" % x for x in b])
-
-    def clear_irq_bit(self, reg, bit):
-        self.write_register(reg, bit)
+        self.eps = {}
 
 
 class TrailingBytes(Bytes):
@@ -468,7 +417,7 @@ usb_raw_event_type = Enum(
 )
 
 usb_raw_event = Struct(
-    "type" / usb_raw_event_type, "length" / Int32un, "data" / TrailingBytes(this.length)
+    "kind" / usb_raw_event_type, "length" / Int32un, "data" / TrailingBytes(this.length)
 )
 
 usb_raw_ep_io = Struct(
@@ -515,7 +464,7 @@ usb_raw_timeout_type = Enum(
 )
 
 usb_raw_timeout = Struct(
-    "type" / usb_raw_timeout_type, "param" / Int32un, "timeout" / Int32un
+    "kind" / usb_raw_timeout_type, "param" / Int32un, "timeout" / Int32un
 )
 
 
@@ -594,12 +543,13 @@ class RawGadgetRequests(IOCTLRequest):
 
 
 class RawGadget:
-    def __init__(self):
+    def __init__(self, verbose=1):
         self.udc_driver = os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower()
         self.udc_device = os.environ.get("RG_UDC_DEVICE", "dummy_udc.0").lower()
 
         self.fd = None
         self.last_ep_addr = 0
+        self.verbose = verbose
 
     def open(self):
         self.fd = open("/dev/raw-gadget", "bw")
@@ -624,12 +574,14 @@ class RawGadget:
         RawGadgetRequests.USB_RAW_IOCTL_RUN(self.fd)
 
     def event_fetch(self, data):
-        arg = usb_raw_event.build({"type": 0, "length": len(data), "data": data})
+        arg = usb_raw_event.build({"kind": 0, "length": len(data), "data": data})
         try:
             _, data = RawGadgetRequests.USB_RAW_IOCTL_EVENT_FETCH(self.fd, arg)
         except TimeoutError:
             return None
-        return usb_raw_event.parse(data)
+
+        raw = usb_raw_event.parse(data)
+        return RawGadgetEvent(raw.kind, raw.data)
 
     def ep0_write(self, data, flags=0):
         arg = usb_raw_ep_io.build(
@@ -648,35 +600,49 @@ class RawGadget:
             rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP0_READ(self.fd, arg)
         except TimeoutError:
             return None, None
-        return rv, data
+
+        log.debug(f"gadget ep0_read {rv=}")
+        return rv, usb_raw_ep_io.parse(data)
 
     def ep_enable(self, ep_desc):
         rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_ENABLE(self.fd, ep_desc)
-        log.info(f"ep_enable: {rv=}")
         return rv
 
-    def ep_disable(self, ep_num):
-        RawGadgetRequests.USB_RAW_IOCTL_EP_DISABLE(self.fd, ep_num)
-        log.info(f"ep_disable: {ep_num=}")
+    def ep_disable(self, handle: int):
+        RawGadgetRequests.USB_RAW_IOCTL_EP_DISABLE(self.fd, handle)
+        log.info(f"ep_disable: {handle=}")
 
-    def ep_write(self, ep_num, data, flags=0):
+    def ep_write(self, handle, data, flags=0):
         arg = usb_raw_ep_io.build(
-            {"ep": ep_num, "flags": flags, "length": len(data), "data": data}
+            {"ep": handle, "flags": flags, "length": len(data), "data": data}
         )
         try:
-            RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
+            rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
         except TimeoutError:
-            pass
+            log.warning(f"Timeout: ep_write {handle} {data.hex()}")
+            return
 
-    def ep_read(self, ep_num, data, flags=0):
+        if rv != len(data):
+            log.warning(f"ep_write {handle=} length={len(data)} {rv=}")
+
+        elif self.verbose > 4:
+            log.debug(f"ep_write: {handle=} {flags=} {rv=}")
+
+    def ep_read(self, handle, length, flags=0):
         arg = usb_raw_ep_io.build(
-            {"ep": ep_num, "flags": flags, "length": len(data), "data": data}
+            {"ep": handle, "flags": flags, "length": length, "data": bytes(length)}
         )
         try:
-            rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP_READ(self.fd, arg)
+            rv, arg = RawGadgetRequests.USB_RAW_IOCTL_EP_READ(self.fd, arg)
         except TimeoutError:
-            return None, None
-        return rv, data
+            if self.verbose > 4:
+                log.debug(f"Timeout: ep_read {handle=}")
+            return None
+
+        if self.verbose > 3:
+            log.debug(f"ep_read: {handle=} {flags=} {length=} {rv=}")
+
+        return usb_raw_ep_io.parse(arg).data[:rv]
 
     def configure(self):
         RawGadgetRequests.USB_RAW_IOCTL_CONFIGURE(self.fd)
@@ -693,5 +659,189 @@ class RawGadget:
         RawGadgetRequests.USB_RAW_IOCTL_EP0_STALL(self.fd)
 
     def set_timeout(self, typ, param, timeout):
-        arg = usb_raw_timeout.build({"type": typ, "param": param, "timeout": timeout})
-        RawGadgetRequests.USB_RAW_IOCTL_SET_TIMEOUT(self.fd, arg)
+        arg = usb_raw_timeout.build({"kind": typ, "param": param, "timeout": timeout})
+        try:
+            RawGadgetRequests.USB_RAW_IOCTL_SET_TIMEOUT(self.fd, arg)
+        except Exception as e:
+            log.info(f'set_timeout: {e}')
+
+
+@dataclass
+class RawGadgetEvent:
+    kind: int
+    data: bytes
+
+
+@dataclass
+class EpReadEvent:
+    ep: USBEndpoint
+    data: bytes
+
+
+class ControlHandler:
+    """Send and receive raw gadget control events that can block."""
+
+    _queue: Queue[tuple[bytes | None, USBDirection | None]]
+
+    def __init__(self, backend):
+        self.backend = backend
+
+        self._queue = Queue(100)
+        self._threads = [
+            Thread(target=self._sender, name="ctrl-send", daemon=True),
+            Thread(target=self._receiver, name="ctrl-recv", daemon=True),
+        ]
+        self._threads[0].start()
+        self._threads[1].start()
+
+        # set timeouts for cancelation
+        self.backend.device.set_timeout(
+            usb_raw_timeout_type.USB_RAW_TIMEOUT_EVENT_FETCH, 0, 200
+        )
+        self.backend.device.set_timeout(
+            usb_raw_timeout_type.USB_RAW_TIMEOUT_EP0_IO, 0, 10000
+        )
+
+    def stop(self):
+        log.debug("ctrl stopping")
+        self._queue.put((None, None))
+        self._threads[0].join()
+        self._threads[1].join()
+
+    def send(self, data: bytes, direction: USBDirection, blocking=False):
+        self._queue.put((data, direction))
+        if blocking:
+            self._queue.join()
+
+    def _sender(self):
+        while True:
+            data, direction = self._queue.get()
+            if data is None:
+                break
+            if direction == USBDirection.OUT:
+                self.backend.device.ep0_read(data)
+            else:
+                self.backend.device.ep0_write(data)
+            self._queue.task_done()
+
+        log.debug("ctrl-send done")
+
+    def _receiver(self):
+        while self.backend.device.fd:
+            event = self.backend.device.event_fetch(bytes(usb_ctrlrequest.sizeof()))
+            if event is not None:
+                self.backend.queue.put(event)
+
+        log.debug("ctrl-recv done")
+
+
+class EndpointHandler:
+    ep: USBEndpoint
+    backend: RawGadgetBackend
+
+    # We could validate the endpoint descriptor against the UDC
+    # endpoint capabilities and the selected USB device speed.
+    # This will, however, limit the ability to emulate devices
+    # that do not strictly follow the USB specifications;
+    # some UDCs unofficially support this. As having this ability
+    # might be useful for fuzzing, use the endpoint descriptor as
+    # is. As a trade off, this might lead to unpredictable errors
+    # during the device emulation.
+    def __init__(self, ep, backend):
+        self.ep = ep
+        self.backend = backend
+        self._stop = False
+
+        self._handle = self.backend.device.ep_enable(ep.get_descriptor())
+        log.debug(f"enable {ep} ({ep.address}) handle={self._handle}")
+
+        # set timeout for cancelation
+        self.backend.device.set_timeout(
+            usb_raw_timeout_type.USB_RAW_TIMEOUT_EP_IO, self._handle, 10000
+        )
+
+    def stop(self):
+        log.debug(f"ep-{self.ep.number} stopping")
+        self._stop = True
+        try:
+            self.backend.device.ep_disable(self._handle)
+        except Exception as e:
+            log.warning(f"disable {self.ep}: {e}")
+
+
+class EndpointOutHandler(EndpointHandler):
+    """Read from host (HCD) and write to device (libusb).
+
+    Only the read can block.
+    """
+
+    def __init__(self, ep, backend):
+        super().__init__(ep, backend)
+        self._thread = Thread(
+            target=self._receiver, name=f"ep-{self.ep.number}", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        super().stop()
+        self._thread.join()
+
+    def _receiver(self):
+        while not self._stop:
+            data = self.backend.device.ep_read(self.ep.number, self.ep.max_packet_size)
+            if data is not None:
+                event = EpReadEvent(ep=self.ep, data=data)
+                self.backend.queue.put(event)
+
+        log.debug(f"ep-{self.ep.number} stopped")
+
+
+class EndpointInHandler(EndpointHandler):
+    """Read from device (libusb) and write to host (HCD).
+
+    Both sides can block.
+    """
+
+    def __init__(self, ep, backend):
+        super().__init__(ep, backend)
+        self._queue = Queue(100)
+
+        self._threads = [
+            Thread(target=self._sender, name=f"ep-{self.ep.number}-send", daemon=True),
+            Thread(
+                target=self._receiver, name=f"ep-{self.ep.number}-recv", daemon=True
+            ),
+        ]
+        self._threads[0].start()
+        self._threads[1].start()
+
+    def stop(self):
+        super().stop()
+        self._queue.put(None)
+        self._threads[0].join()
+        self._threads[1].join()
+
+    def send(self, data, blocking):
+        self._queue.put(data)
+        if blocking:
+            self._queue.join()
+
+    def _sender(self):
+        """Write data to host."""
+        while True:
+            data = self._queue.get()
+            if self._stop:
+                break
+            if self.backend.verbose > 3:
+                log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
+            self.backend.device.ep_write(self._handle, data)
+            self._queue.task_done()
+
+        log.debug(f"ep-{self.ep.number}-send stopped")
+
+    def _receiver(self):
+        """Read data from device."""
+        while not self._stop:
+            self.backend.connected_device.handle_data_requested(self.ep, timeout=1000)
+
+        log.debug(f"ep-{self.ep.number}-recv stopped")

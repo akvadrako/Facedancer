@@ -101,7 +101,7 @@ class FacedancerApp:
         self.init_commands()
 
         if self.verbose > 0:
-            log.info(self.app_name, "initialized")
+            log.info(f"{self.app_name} initialized")
 
     def init_commands(self):
         pass

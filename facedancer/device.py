@@ -509,7 +509,7 @@ class USBBaseDevice(USBDescribable, USBRequestHandler):
         log.error(f"Received {len(data)} bytes of data on invalid EP{endpoint_number}/OUT.")
 
 
-    def handle_data_requested(self, endpoint: USBEndpoint):
+    def handle_data_requested(self, endpoint: USBEndpoint, *, timeout: int|None =None):
         """ Handler called when the host requests data on a non-control endpoint.
 
         Typically, this method will delegate the request to the appropriate
@@ -518,6 +518,7 @@ class USBBaseDevice(USBDescribable, USBRequestHandler):
 
         Args:
             endpoint_number : The endpoint number on which the host requested data.
+            timeout : milliseconds. If None, defaults to endpoint.interval or 1 second
         """
 
         # If we have a configuration, delegate to it.
