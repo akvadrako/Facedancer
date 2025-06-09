@@ -34,6 +34,7 @@ dependencies = [
     "prompt-toolkit",
     "libusb1",
     "construct>=2.10",
+    "hid-parser>=0.1.0",
 ]
 
 dynamic = ["version"]

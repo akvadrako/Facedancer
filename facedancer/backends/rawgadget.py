@@ -206,11 +206,15 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             data : The data to be sent.
             blocking : If true, this function should wait for the transfer to complete.
         """
+        if self.verbose > 4:
+            log.debug(
+                f"send ep{endpoint_number} {self.last_control_direction.name} len={len(data)} {blocking=}"
+            )
 
         if endpoint_number == 0:
             if self.verbose > 2:
                 log.info(
-                    f"send control dir={self.last_control_direction} len={len(data)} {blocking=}"
+                    f"send ep0 {self.last_control_direction.name} {data.hex(' ', -2)}"
                 )
             self.control.send(data, self.last_control_direction, blocking)
         else:
@@ -237,9 +241,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                        before returning.
         """
         acked = self.last_control_acked
-        log.info(
-            f"ack_status_stage {acked=} {direction.name} {endpoint_number=} {blocking=}"
-        )
+        if self.verbose > 4:
+            log.info(f"ack {acked=} {direction.name} {endpoint_number=} {blocking=}")
         if acked:
             return
 
@@ -285,7 +288,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     # Internal functions
 
     def _handle_raw_gadget_event(self, kind, data):
-        if self.verbose > 2:
+        if self.verbose > 4:
             log.debug(f"recv event {kind} len={len(data)}")
 
         match kind:
@@ -324,7 +327,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         if self.verbose > 2:
             log.debug(f"recv control {req}")
 
-        self.last_control_direction = req.get_direction()
+        self.last_control_direction = USBDirection(req.get_direction())
         self.last_control_acked = False
 
         if req.direction == USBDirection.OUT and req.length != 0:
@@ -332,6 +335,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             assert ep_request and rv == req.length
             req.data = bytes(ep_request.data)
             self.last_control_acked = True
+            if self.verbose > 3:
+                log.debug(f"  data {data.hex(' ', -2)}")
 
         reenable = False
         if (
@@ -601,7 +606,6 @@ class RawGadget:
         except TimeoutError:
             return None, None
 
-        log.debug(f"gadget ep0_read {rv=}")
         return rv, usb_raw_ep_io.parse(data)
 
     def ep_enable(self, ep_desc):
@@ -663,7 +667,7 @@ class RawGadget:
         try:
             RawGadgetRequests.USB_RAW_IOCTL_SET_TIMEOUT(self.fd, arg)
         except Exception as e:
-            log.info(f'set_timeout: {e}')
+            log.info(f"set_timeout: {e}")
 
 
 @dataclass
@@ -706,7 +710,9 @@ class ControlHandler:
         log.debug("ctrl stopping")
         self._queue.put((None, None))
         self._threads[0].join()
-        self._threads[1].join()
+
+        # FIXME - this does not work
+        # self._threads[1].join()
 
     def send(self, data: bytes, direction: USBDirection, blocking=False):
         self._queue.put((data, direction))

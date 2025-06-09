@@ -1,26 +1,26 @@
 #
 # This file is part of Facedancer.
 #
-""" USB Proxy implementation. """
+"""USB Proxy implementation."""
 
 import atexit
 import platform
 import usb1
 import sys
 
-from usb1        import USBError, USBErrorTimeout
+from usb1 import USBError, USBErrorTimeout
 
-from .           import DeviceSpeed, USBConfiguration, USBDirection
-from .endpoint   import USBEndpoint
-from .device     import USBBaseDevice
-from .errors     import DeviceNotFoundError
-from .logging    import log
-from .request    import USBControlRequest
-from .types      import USB
+from . import DeviceSpeed, USBConfiguration, USBDirection
+from .endpoint import USBEndpoint
+from .device import USBBaseDevice
+from .errors import DeviceNotFoundError
+from .logging import log
+from .request import USBControlRequest
+from .types import USB
 
 
 class USBProxyDevice(USBBaseDevice):
-    """ USB Proxy Device """
+    """USB Proxy Device"""
 
     name = "USB Proxy Device"
 
@@ -48,8 +48,9 @@ class USBProxyDevice(USBBaseDevice):
         # detach it from any kernel-side driver that may prevent us
         # from communicating with it...
         self.proxied_device.open(device, detach=True)
-        log.info(f"Found {self.proxied_device.device_speed().name} speed device to proxy: {device}")
-
+        log.info(
+            f"Found {self.proxied_device.device_speed().name} speed device to proxy: {device}"
+        )
 
     def add_filter(self, filter_object, head=False):
         """
@@ -59,7 +60,6 @@ class USBProxyDevice(USBBaseDevice):
             self.filter_list.insert(0, filter_object)
         else:
             self.filter_list.append(filter_object)
-
 
     def connect(self):
         """
@@ -89,7 +89,6 @@ class USBProxyDevice(USBBaseDevice):
         # skipping USB.state_attached may not be strictly correct (9.1.1.{1,2})
         self.state = USB.state_powered
 
-
     # - event handlers --------------------------------------------------------
 
     def configured(self, configuration: USBConfiguration):
@@ -106,18 +105,17 @@ class USBProxyDevice(USBBaseDevice):
 
         # All interfaces on the configuration are set to their default setting.
         configuration.active_interfaces = {
-            interface.number : interface
-                for interface in configuration.get_interfaces()
-                    if interface.alternate == 0
+            interface.number: interface
+            for interface in configuration.get_interfaces()
+            if interface.alternate == 0
         }
 
         # Pass our configuration on to the core device.
         self.backend.configured(configuration)
-        configuration.parent = self # FIXME Not great semantics
+        configuration.parent = self  # FIXME Not great semantics
         self.configuration = configuration
 
         self._ack_status_stage()
-
 
     def interface_changed(self, interface_number: int, alternate: int):
         """
@@ -138,11 +136,9 @@ class USBProxyDevice(USBBaseDevice):
         self.configuration.active_interfaces[interface_number] = interface
         self._ack_status_stage()
 
-
     def handle_bus_reset(self):
         super().handle_bus_reset()
         self.proxied_device.reset()
-
 
     def handle_request(self, request: USBControlRequest):
         """
@@ -154,14 +150,11 @@ class USBProxyDevice(USBBaseDevice):
         else:
             self._proxy_out_control_request(request)
 
-
     def handle_get_configuration_request(self, request):
         super().handle_get_configuration_request(request)
 
-
     def handle_get_descriptor_request(self, request):
         super().handle_get_descriptor_request(request)
-
 
     def handle_data_received(self, endpoint, data):
         """
@@ -178,9 +171,7 @@ class USBProxyDevice(USBBaseDevice):
         if data:
             try:
                 self.proxied_device.write(ep_num, data)
-            except USBError as e:
-                log.warning(f"STALL - handle_data_available: {e}")
-
+            except USBError:
                 stalled = True
 
                 for f in self.filter_list:
@@ -190,7 +181,7 @@ class USBProxyDevice(USBBaseDevice):
                     self.backend.stall_endpoint(0, USBDirection.OUT)
 
     def handle_data_requested(self, endpoint: USBEndpoint, *, timeout=None):
-        """ Handler called when the host requests data on a non-control endpoint.
+        """Handler called when the host requests data on a non-control endpoint.
 
         Typically, this method will delegate the request to the appropriate
         configuration+interface+endpoint. If overridden, the
@@ -257,7 +248,6 @@ class USBProxyDevice(USBBaseDevice):
 
         # If we stalled immediately, handle the stall and return without proxying.
         if stalled:
-            log.warning("STALL - filter_control_in_setup")
             self.backend.stall_endpoint(0, USBDirection.IN)
             return
 
@@ -274,22 +264,20 @@ class USBProxyDevice(USBBaseDevice):
                 index=request.index,
                 length=request.length,
             )
-        except USBError as e:
-            log.warning(f"STALL - proxied_device.controlRead - {e}")
+        except USBError:
             stalled = True
 
         # Run filters here.
         for f in self.filter_list:
             request, data, stalled = f.filter_control_in(request, data, stalled)
 
-        #... and proxy it to our victim.
+        # ... and proxy it to our victim.
         if stalled:
             # TODO: allow stalling of eps other than 0!
             self.backend.stall_endpoint(0, USBDirection.IN)
         else:
             # TODO: support control endpoints other than 0
             self.control_send(0, request, data)
-
 
     def _proxy_out_control_request(self, request: USBControlRequest):
         """
@@ -310,27 +298,25 @@ class USBProxyDevice(USBBaseDevice):
                     request=request.request,
                     value=request.value,
                     index=request.index,
-                    data=data
+                    data=data,
                 )
                 self._ack_status_stage()
 
             # Special case: we've stalled, allow the filters to decide what to do.
-            except USBError as e:
-                log.warning(f"STALL - controlWrite - {e}")
+            except USBError:
                 stalled = True
 
                 for f in self.filter_list:
-                    request, data, stalled = f.handle_out_request_stall(request, data, stalled)
+                    request, data, stalled = f.handle_out_request_stall(
+                        request, data, stalled
+                    )
 
                 if stalled:
                     self.backend.stall_endpoint(0, USBDirection.OUT)
 
 
-
-
 class LibUSB1Device:
-    """ A wrapper around the proxied device based on libusb1. """
-
+    """A wrapper around the proxied device based on libusb1."""
 
     """ Class variable that stores our global libusb library context. """
     context: usb1.USBContext | None = None
@@ -338,10 +324,9 @@ class LibUSB1Device:
     """ Class variable that stores our device handle. """
     device_handle: usb1.USBDeviceHandle | None = None
 
-
     @classmethod
     def _get_libusb_context(cls) -> usb1.USBContext:
-        """ Retrieves the libusb context we'll use to fetch libusb device instances. """
+        """Retrieves the libusb context we'll use to fetch libusb device instances."""
 
         # If we don't have a libusb context, create one.
         if cls.context is None:
@@ -357,7 +342,7 @@ class LibUSB1Device:
 
     @classmethod
     def _destroy_libusb_context(cls):
-        """ Destroys our libusb context on closing our python instance. """
+        """Destroys our libusb context on closing our python instance."""
         if cls.device_handle is not None:
             cls._release()
             cls.device_handle.close()
@@ -374,17 +359,16 @@ class LibUSB1Device:
         try:
             cls.device_handle.setAutoDetachKernelDriver(detach)
         except usb1.USBErrorNotSupported as e:
-            log.debug(f'setAutoDetachKernelDriver: {e}')
+            log.debug(f"setAutoDetachKernelDriver: {e}")
 
         cls._claim()
 
         return cls.device_handle
 
-
     # TODO adapt logic from pygreat usb1.py
     @classmethod
     def find(cls, idVendor, idProduct, find_all=True):
-        """ Finds a USB device by its identifiers. """
+        """Finds a USB device by its identifiers."""
 
         matching_devices = []
         context = cls._get_libusb_context()
@@ -404,7 +388,7 @@ class LibUSB1Device:
     @classmethod
     def setInterface(cls, interface: int, alt: int):
         """libusb1 recommends always using this instead of sending control packets."""
-        log.info(f'LibUSB1Device setInterface {interface} alt {alt}')
+        log.info(f"LibUSB1Device setInterface {interface} alt {alt}")
         cls._handle().setInterfaceAltSetting(interface, alt)
 
     @classmethod
@@ -412,10 +396,10 @@ class LibUSB1Device:
         """libusb1 recommends always using this instead of sending control packets."""
         old = cls._handle().getConfiguration()
         if old == number:
-            log.info(f'LibUSB1Device keeping configuration {number}')
+            log.info(f"LibUSB1Device keeping configuration {number}")
             return
 
-        log.info(f'LibUSB1Device set configuration {old} → {number}')
+        log.info(f"LibUSB1Device set configuration {old} → {number}")
 
         # prevent kernel driver from re-attaching
         cls._handle().setAutoDetachKernelDriver(0)
@@ -457,10 +441,14 @@ class LibUSB1Device:
                 if platform.system() == "Darwin":
                     log.error("You may need to run your proxy code as root.\n")
                 elif platform.system() == "Linux":
-                    log.error("Please ensure you have configured an entry for the device in your")
+                    log.error(
+                        "Please ensure you have configured an entry for the device in your"
+                    )
                     log.error("/etc/udev/rules.d directory.\n")
                 elif platform.system() == "Windows":
-                    log.error("You may need to experiment with the Zadig driver to access the device.\n")
+                    log.error(
+                        "You may need to experiment with the Zadig driver to access the device.\n"
+                    )
                 sys.exit(1)
 
     @classmethod
@@ -475,31 +463,30 @@ class LibUSB1Device:
     def device_speed(cls):
         return DeviceSpeed(cls._handle().getDevice().getDeviceSpeed())
 
-
     @classmethod
     def controlRead(cls, request_type, request, value, index, length, timeout=1000):
-        return cls._handle().controlRead(request_type, request, value, index, length, timeout)
-
+        return cls._handle().controlRead(
+            request_type, request, value, index, length, timeout
+        )
 
     @classmethod
     def controlWrite(cls, request_type, request, value, index, data, timeout=1000):
-        return cls._handle().controlWrite(request_type, request, value, index, data, timeout)
-
+        return cls._handle().controlWrite(
+            request_type, request, value, index, data, timeout
+        )
 
     @classmethod
     def read(cls, endpoint_number, length, timeout=1000):
         # Avoid accidental uses of endpoint address
-        endpoint_number = endpoint_number & 0x7f
+        endpoint_number = endpoint_number & 0x7F
 
         # TODO support interrupt endpoints
         return cls._handle().bulkRead(endpoint_number, length, timeout)
-
 
     @classmethod
     def write(cls, endpoint_number, data, timeout=1000):
         # TODO support interrupt endpoints
         return cls._handle().bulkWrite(endpoint_number, data, timeout)
-
 
     @classmethod
     def clear_halt(cls, endpoint_number, direction):
@@ -514,16 +501,16 @@ class LibUSB1Device:
 
 
 if __name__ == "__main__":
-    from .filters.standard  import USBProxySetupFilters
-    from .filters.logging   import USBProxyPrettyPrintFilter
+    from .filters.standard import USBProxySetupFilters
+    from .filters.logging import USBProxyPrettyPrintFilter
 
     # akai midimix
-    VENDOR_ID  = 0x09e8
+    VENDOR_ID = 0x09E8
     PRODUCT_ID = 0x0031
 
     # xbox controller
-    #VENDOR_ID  = 0x045e
-    #PRODUCT_ID = 0x02d1
+    # VENDOR_ID  = 0x045e
+    # PRODUCT_ID = 0x02d1
 
     device = USBProxyDevice(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
 
@@ -532,7 +519,9 @@ if __name__ == "__main__":
 
     async def configure_logging():
         import logging
+
         logging.getLogger("facedancer").setLevel(logging.INFO)
 
     from facedancer import main
+
     main(device, configure_logging())
