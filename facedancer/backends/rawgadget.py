@@ -14,6 +14,7 @@ import errno
 import fcntl
 import os
 from threading import Thread
+from signal import signal, SIGUSR1, pthread_kill
 
 from queue import Queue
 
@@ -204,8 +205,11 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             endpoint_number : The number of the IN endpoint on which data should be sent.
             data : The data to be sent.
-            blocking : If true, this function should wait for the transfer to complete.
+            blocking : This must always be true.
         """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(f" {type(data)=}, must be bytes")
+
         if self.verbose > 4:
             log.debug(
                 f"send ep{endpoint_number} {self.last_control_direction.name} len={len(data)} {blocking=}"
@@ -216,11 +220,11 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 log.info(
                     f"send ep0 {self.last_control_direction.name} {data.hex(' ', -2)}"
                 )
-            self.control.send(data, self.last_control_direction, blocking)
+            self.control.send(data, self.last_control_direction)
         else:
             handler = self.eps[endpoint_number]
             assert isinstance(handler, EndpointInHandler)
-            handler.send(data, blocking)
+            handler.send(data)
 
     def ack_status_stage(
         self,
@@ -237,8 +241,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                        (This should match the direction of the DATA stage.)
             endpoint_number : The endpoint number on which the control request
                               occurred.
-            blocking : True if we should wait for the ACK to be fully issued
-                       before returning.
+            blocking : Only True is supported.
         """
         acked = self.last_control_acked
         if self.verbose > 4:
@@ -249,7 +252,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         if endpoint_number != 0:
             raise NotImplementedError()
 
-        self.control.send(b"", direction, blocking)
+        self.control.send(b"", direction)
 
     def stall_endpoint(
         self, endpoint_number: int, direction: USBDirection = USBDirection.OUT
@@ -562,6 +565,7 @@ class RawGadget:
     def close(self):
         assert self.fd is not None
         self.fd.close()
+        self.fd = None
 
     def run(self, speed: DeviceSpeed):
         if override := os.environ.get("RG_USB_SPEED"):
@@ -609,8 +613,9 @@ class RawGadget:
         return rv, usb_raw_ep_io.parse(data)
 
     def ep_enable(self, ep_desc):
-        rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_ENABLE(self.fd, ep_desc)
-        return rv
+        handle, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_ENABLE(self.fd, ep_desc)
+        log.info(f"ep_enable: {handle=}")
+        return handle
 
     def ep_disable(self, handle: int):
         RawGadgetRequests.USB_RAW_IOCTL_EP_DISABLE(self.fd, handle)
@@ -662,13 +667,6 @@ class RawGadget:
     def ep0_stall(self):
         RawGadgetRequests.USB_RAW_IOCTL_EP0_STALL(self.fd)
 
-    def set_timeout(self, typ, param, timeout):
-        arg = usb_raw_timeout.build({"kind": typ, "param": param, "timeout": timeout})
-        try:
-            RawGadgetRequests.USB_RAW_IOCTL_SET_TIMEOUT(self.fd, arg)
-        except Exception as e:
-            log.info(f"set_timeout: {e}")
-
 
 @dataclass
 class RawGadgetEvent:
@@ -682,59 +680,42 @@ class EpReadEvent:
     data: bytes
 
 
+def _ignore(signum, _frame):
+    log.debug(f"ignoring {signum}")
+
+
 class ControlHandler:
     """Send and receive raw gadget control events that can block."""
 
-    _queue: Queue[tuple[bytes | None, USBDirection | None]]
-
     def __init__(self, backend):
         self.backend = backend
+        self._stop = False
 
-        self._queue = Queue(100)
-        self._threads = [
-            Thread(target=self._sender, name="ctrl-send", daemon=True),
-            Thread(target=self._receiver, name="ctrl-recv", daemon=True),
-        ]
-        self._threads[0].start()
-        self._threads[1].start()
+        # use SIGUSR1 to interrupt waiting for control events
+        signal(SIGUSR1, _ignore)
 
-        # set timeouts for cancelation
-        self.backend.device.set_timeout(
-            usb_raw_timeout_type.USB_RAW_TIMEOUT_EVENT_FETCH, 0, 200
-        )
-        self.backend.device.set_timeout(
-            usb_raw_timeout_type.USB_RAW_TIMEOUT_EP0_IO, 0, 10000
-        )
+        self._thread = Thread(target=self._receiver, name="ctrl-recv", daemon=True)
+        self._thread.start()
 
     def stop(self):
-        log.debug("ctrl stopping")
-        self._queue.put((None, None))
-        self._threads[0].join()
+        log.debug(f"ctrl stopping, thread {self._thread.ident}")
+        self._stop = True
+        pthread_kill(self._thread.ident, SIGUSR1)
+        self._thread.join()
 
-        # FIXME - this does not work
-        # self._threads[1].join()
-
-    def send(self, data: bytes, direction: USBDirection, blocking=False):
-        self._queue.put((data, direction))
-        if blocking:
-            self._queue.join()
-
-    def _sender(self):
-        while True:
-            data, direction = self._queue.get()
-            if data is None:
-                break
-            if direction == USBDirection.OUT:
-                self.backend.device.ep0_read(data)
-            else:
-                self.backend.device.ep0_write(data)
-            self._queue.task_done()
-
-        log.debug("ctrl-send done")
+    def send(self, data: bytes, direction: USBDirection):
+        if direction == USBDirection.OUT:
+            self.backend.device.ep0_read(data)
+        else:
+            self.backend.device.ep0_write(data)
 
     def _receiver(self):
-        while self.backend.device.fd:
-            event = self.backend.device.event_fetch(bytes(usb_ctrlrequest.sizeof()))
+        while not self._stop:
+            try:
+                event = self.backend.device.event_fetch(bytes(usb_ctrlrequest.sizeof()))
+            except InterruptedError:
+                continue
+
             if event is not None:
                 self.backend.queue.put(event)
 
@@ -761,11 +742,6 @@ class EndpointHandler:
         self._handle = self.backend.device.ep_enable(ep.get_descriptor())
         log.debug(f"enable {ep} ({ep.address}) handle={self._handle}")
 
-        # set timeout for cancelation
-        self.backend.device.set_timeout(
-            usb_raw_timeout_type.USB_RAW_TIMEOUT_EP_IO, self._handle, 10000
-        )
-
     def stop(self):
         log.debug(f"ep-{self.ep.number} stopping")
         self._stop = True
@@ -776,10 +752,7 @@ class EndpointHandler:
 
 
 class EndpointOutHandler(EndpointHandler):
-    """Read from host (HCD) and write to device (libusb).
-
-    Only the read can block.
-    """
+    """Read from host (HCD) and write to device (libusb)."""
 
     def __init__(self, ep, backend):
         super().__init__(ep, backend)
@@ -794,7 +767,13 @@ class EndpointOutHandler(EndpointHandler):
 
     def _receiver(self):
         while not self._stop:
-            data = self.backend.device.ep_read(self.ep.number, self.ep.max_packet_size)
+            try:
+                data = self.backend.device.ep_read(
+                    self._handle, self.ep.max_packet_size
+                )
+            except BrokenPipeError:
+                continue
+
             if data is not None:
                 event = EpReadEvent(ep=self.ep, data=data)
                 self.backend.queue.put(event)
@@ -803,50 +782,33 @@ class EndpointOutHandler(EndpointHandler):
 
 
 class EndpointInHandler(EndpointHandler):
-    """Read from device (libusb) and write to host (HCD).
-
-    Both sides can block.
-    """
+    """Read from device (libusb) and write to host (HCD)."""
 
     def __init__(self, ep, backend):
         super().__init__(ep, backend)
-        self._queue = Queue(100)
 
-        self._threads = [
-            Thread(target=self._sender, name=f"ep-{self.ep.number}-send", daemon=True),
-            Thread(
-                target=self._receiver, name=f"ep-{self.ep.number}-recv", daemon=True
-            ),
-        ]
-        self._threads[0].start()
-        self._threads[1].start()
+        self._thread = Thread(
+            target=self._receiver,
+            name=f"ep-{self.ep.number}-recv",
+            daemon=True,
+        )
+        self._thread.start()
 
     def stop(self):
         super().stop()
-        self._queue.put(None)
-        self._threads[0].join()
-        self._threads[1].join()
+        self._thread.join()
 
-    def send(self, data, blocking):
-        self._queue.put(data)
-        if blocking:
-            self._queue.join()
-
-    def _sender(self):
-        """Write data to host."""
-        while True:
-            data = self._queue.get()
-            if self._stop:
-                break
-            if self.backend.verbose > 3:
-                log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
-            self.backend.device.ep_write(self._handle, data)
-            self._queue.task_done()
-
-        log.debug(f"ep-{self.ep.number}-send stopped")
+    def send(self, data):
+        if self.backend.verbose > 3:
+            log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
+        self.backend.device.ep_write(self._handle, data)
 
     def _receiver(self):
-        """Read data from device."""
+        """Read data from device.
+
+        The proxy will call backend.send_on_endpoint()
+        which will call self.send().
+        """
         while not self._stop:
             self.backend.connected_device.handle_data_requested(self.ep, timeout=1000)
 

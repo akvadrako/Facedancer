@@ -224,6 +224,9 @@ class USBProxyDevice(USBBaseDevice):
 
         # If our data wasn't filtered out, transmit it to the target!
         if data:
+            if not endpoint.get_device():
+                log.warning("endpoint has no device")
+                return
             endpoint.send(data)
 
     # - helpers ---------------------------------------------------------------
