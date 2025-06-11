@@ -24,8 +24,6 @@ class USBProxySetupFilters(USBProxyFilter):
 
     MAX_PACKET_SIZE_EP0 = 64
 
-    configurations: dict[int, USBDescriptor]
-
     def __init__(self, device, verbose=0):
         self.device = device
         self.configurations = {}
@@ -50,7 +48,7 @@ class USBProxySetupFilters(USBProxyFilter):
             if descriptor_type == self.DESCRIPTOR_CONFIGURATION and req.length >= 32:
                 configuration = USBDescribable.from_binary_descriptor(data)
                 self.configurations[configuration.number] = configuration
-                if self.verbose > 2:
+                if self.verbose > 0:
                     log.info("-- Storing configuration {} --".format(configuration))
 
 
@@ -58,12 +56,10 @@ class USBProxySetupFilters(USBProxyFilter):
                 # Patch our data to overwrite the maximum packet size on EP0.
                 # See USBProxy.connect for a rationale on this.
                 device = USBDescribable.from_binary_descriptor(data)
-                old = device.max_packet_size_ep0
-                if old != 64:
-                    device.max_packet_size_ep0 = 64
-                    data = bytearray(device.get_descriptor())[:len(data)]
-                    if self.verbose > 0:
-                        log.info(f"-- Patched device descriptor. max_packet_size_ep0 {old} to 64 --")
+                device.max_packet_size_ep0 = 64
+                data = bytearray(device.get_descriptor())[:len(data)]
+                if self.verbose > 0:
+                    log.info("-- Patched device descriptor. --")
 
         return req, data, stalled
 
@@ -73,14 +69,13 @@ class USBProxySetupFilters(USBProxyFilter):
         # handle it ourself, and absorb it.
         if req.get_recipient() == self.RECIPIENT_DEVICE and \
            req.request == self.SET_ADDRESS_REQUEST:
-            log.info(f"setup: out - handle set_address {req}")
             req.acknowledge(blocking=True)
             self.device.set_address(req.value)
             return None, None
 
-        # Special case: SET_CONFIGURATION_REQUEST
-        # libusb1 recommends always calling setConfiguration() instead
-        # of sending the control packet manually
+        # Special case: if this is a SET_CONFIGURATION_REQUEST,
+        # pass it through, but also set up the Facedancer hardware
+        # in response.
         if req.get_recipient() == self.RECIPIENT_DEVICE and \
            req.request == self.SET_CONFIGURATION_REQUEST:
             configuration_index = req.value
@@ -89,10 +84,8 @@ class USBProxySetupFilters(USBProxyFilter):
             if configuration_index in self.configurations:
                 configuration = self.configurations[configuration_index]
 
-                if self.verbose > 2:
+                if self.verbose > 0:
                     log.info("-- Applying configuration {} --".format(configuration))
-                elif self.verbose > 0:
-                    log.info(f"-- Applying configuration {configuration.get_identifier()} --")
 
                 self.device.configured(configuration)
 
@@ -101,17 +94,13 @@ class USBProxySetupFilters(USBProxyFilter):
             else:
                 log.warning("-- WARNING: Applying configuration {}, but we've never read that configuration's descriptor! --".format(configuration_index))
 
-            return None, None
-
-        # Special case: SET_INTERFACE_REQUEST
-        # libusb1 recommends calling setInterfaceAlternative()
+        # Special case: if this is a SET_INTERFACE_REQUEST,
+        # pass it through, but also tell the device so it can update
+        # its current configuration.
         if req.get_recipient() == self.RECIPIENT_INTERFACE and \
            req.request == self.SET_INTERFACE_REQUEST:
             interface_number = req.index
             alternate = req.value
-            log.info(f"setup: out - handle SET_INTERFACE_REQUEST {req}")
             self.device.interface_changed(interface_number, alternate)
-
-            return None, None
 
         return req, data
