@@ -180,7 +180,7 @@ class USBProxyDevice(USBBaseDevice):
                 if stalled:
                     self.backend.stall_endpoint(0, USBDirection.OUT)
 
-    def handle_data_requested(self, endpoint: USBEndpoint, *, timeout=None):
+    def handle_data_requested(self, endpoint: USBEndpoint):
         """Handler called when the host requests data on a non-control endpoint.
 
         Typically, this method will delegate the request to the appropriate
@@ -207,10 +207,12 @@ class USBProxyDevice(USBBaseDevice):
 
         try:
             # Quick hack to improve responsiveness on interrupt endpoints.
-            if timeout is None:
-                timeout = endpoint.interval or 1000
-
-            data = self.proxied_device.read(ep_num, endpoint.max_packet_size, timeout)
+            if endpoint.interval:
+                data = self.proxied_device.read(
+                    ep_num, endpoint.max_packet_size, timeout=endpoint.interval
+                )
+            else:
+                data = self.proxied_device.read(ep_num, endpoint.max_packet_size)
 
         except usb1.USBErrorPipe:
             self.proxied_device.clear_halt(ep_num, USBDirection.IN)

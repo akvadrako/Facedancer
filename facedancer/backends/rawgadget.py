@@ -282,7 +282,10 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         match event:
             case RawGadgetEvent(kind, data):
                 self._handle_raw_gadget_event(kind, data)
-            case EpReadEvent(ep, data):
+            case EpReadEvent(ep, handler, data):
+                if handler.stopped:
+                    log.debug(f"discarding event {event} from stopped handler")
+                    return
                 self.connected_device.handle_data_received(ep, data)
             case _:
                 assert False
@@ -349,6 +352,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             log.info(f"gadget set interface {req.index} alt {req.value}")
             reenable = True
 
+        # TODO - only disable handlers for the target interface
         if reenable:
             self._disable()
 
@@ -360,6 +364,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     def _reset(self):
         self.is_configured = False
         self._disable()
+
         if self.connected_device:
             self.connected_device.handle_bus_reset()
 
@@ -463,18 +468,6 @@ usb_raw_ep_info = Struct(
 
 usb_raw_eps_info = Struct("eps" / usb_raw_ep_info[USB_RAW_EPS_NUM_MAX])
 
-usb_raw_timeout_type = Enum(
-    Int32un,
-    USB_RAW_TIMEOUT_INVALID=0,
-    USB_RAW_TIMEOUT_EVENT_FETCH=1,
-    USB_RAW_TIMEOUT_EP0_IO=2,
-    USB_RAW_TIMEOUT_EP_IO=3,
-)
-
-usb_raw_timeout = Struct(
-    "kind" / usb_raw_timeout_type, "param" / Int32un, "timeout" / Int32un
-)
-
 
 class IOCTLRequest:
     IOC_NONE = 0
@@ -547,7 +540,6 @@ class RawGadgetRequests(IOCTLRequest):
     USB_RAW_IOCTL_EP_SET_HALT = IOCTLRequest.ioc("W", "U", 13, Int32un)
     USB_RAW_IOCTL_EP_CLEAR_HALT = IOCTLRequest.ioc("W", "U", 14, Int32un)
     USB_RAW_IOCTL_EP_SET_WEDGE = IOCTLRequest.ioc("W", "U", 15, Int32un)
-    USB_RAW_IOCTL_SET_TIMEOUT = IOCTLRequest.ioc("W", "U", 16, usb_raw_timeout)
 
 
 class RawGadget:
@@ -677,6 +669,7 @@ class RawGadgetEvent:
 @dataclass
 class EpReadEvent:
     ep: USBEndpoint
+    handler: EndpointHandler
     data: bytes
 
 
@@ -689,7 +682,7 @@ class ControlHandler:
 
     def __init__(self, backend):
         self.backend = backend
-        self._stop = False
+        self.stopped = False
 
         # use SIGUSR1 to interrupt waiting for control events
         signal(SIGUSR1, _ignore)
@@ -699,7 +692,7 @@ class ControlHandler:
 
     def stop(self):
         log.debug(f"ctrl stopping, thread {self._thread.ident}")
-        self._stop = True
+        self.stopped = True
         pthread_kill(self._thread.ident, SIGUSR1)
         self._thread.join()
 
@@ -710,7 +703,7 @@ class ControlHandler:
             self.backend.device.ep0_write(data)
 
     def _receiver(self):
-        while not self._stop:
+        while not self.stopped:
             try:
                 event = self.backend.device.event_fetch(bytes(usb_ctrlrequest.sizeof()))
             except InterruptedError:
@@ -737,14 +730,14 @@ class EndpointHandler:
     def __init__(self, ep, backend):
         self.ep = ep
         self.backend = backend
-        self._stop = False
+        self.stopped = False
 
         self._handle = self.backend.device.ep_enable(ep.get_descriptor())
         log.debug(f"enable {ep} ({ep.address}) handle={self._handle}")
 
     def stop(self):
         log.debug(f"ep-{self.ep.number} stopping")
-        self._stop = True
+        self.stopped = True
         try:
             self.backend.device.ep_disable(self._handle)
         except Exception as e:
@@ -752,7 +745,7 @@ class EndpointHandler:
 
 
 class EndpointOutHandler(EndpointHandler):
-    """Read from host (HCD) and write to device (libusb)."""
+    """Read OUT transfers from the host and report them to the core Facedancer code."""
 
     def __init__(self, ep, backend):
         super().__init__(ep, backend)
@@ -766,7 +759,7 @@ class EndpointOutHandler(EndpointHandler):
         self._thread.join()
 
     def _receiver(self):
-        while not self._stop:
+        while not self.stopped:
             try:
                 data = self.backend.device.ep_read(
                     self._handle, self.ep.max_packet_size
@@ -775,14 +768,17 @@ class EndpointOutHandler(EndpointHandler):
                 continue
 
             if data is not None:
-                event = EpReadEvent(ep=self.ep, data=data)
+                event = EpReadEvent(ep=self.ep, handler=self, data=data)
                 self.backend.queue.put(event)
 
         log.debug(f"ep-{self.ep.number} stopped")
 
 
+INTERVAL_MIN_MS = 100
+
+
 class EndpointInHandler(EndpointHandler):
-    """Read from device (libusb) and write to host (HCD)."""
+    """Read IN transfers from the core Facedancer code and send to the host."""
 
     def __init__(self, ep, backend):
         super().__init__(ep, backend)
@@ -809,7 +805,12 @@ class EndpointInHandler(EndpointHandler):
         The proxy will call backend.send_on_endpoint()
         which will call self.send().
         """
-        while not self._stop:
-            self.backend.connected_device.handle_data_requested(self.ep, timeout=1000)
+        while not self.stopped:
+            # The interrupt endpoint interval could be 1ms, and polling 1000
+            # times a second for something we can just block on is too noisy.
+            if self.ep.interval < INTERVAL_MIN_MS:
+                self.ep.interval = INTERVAL_MIN_MS
+
+            self.backend.connected_device.handle_data_requested(self.ep)
 
         log.debug(f"ep-{self.ep.number}-recv stopped")
