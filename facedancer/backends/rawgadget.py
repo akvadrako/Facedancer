@@ -1,16 +1,17 @@
-# Raw Gadget-based Facedancer backend.
-#
-# See https://github.com/xairy/raw-gadget for details about Raw Gadget.
-#
-# Authors:
-#   Andrey Konovalov <andreyknvl@gmail.com>
-#   Kirill Zhirovsky <me@kirill9617.win>
-#   Devin Bayer <dev@doubly.so>
+"""
+Raw Gadget-based Facedancer backend.
+
+See https://github.com/xairy/raw-gadget for details about Raw Gadget.
+
+Authors:
+- Andrey Konovalov <andreyknvl@gmail.com>
+- Kirill Zhirovsky <me@kirill9617.win>
+- Devin Bayer <dev@doubly.so>
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import errno
 import fcntl
 import os
 from threading import Thread
@@ -57,6 +58,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     connected_device: USBDevice
     queue: Queue
     eps: dict[int, EndpointHandler]
+    control: ControlHandler
 
     def __init__(
         self,
@@ -70,7 +72,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             device  : The device that will act as our UDC.          (Optional)
             verbose : The verbosity level of the given application. (Optional)
-            quirks  : List of USB platform quirks.                  (Optional)
+            quirks  : Unused
         """
         super().__init__(device or RawGadget(verbose), verbose)
 
@@ -97,19 +99,14 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
         try:
             rg = open("/dev/raw-gadget")
-            rg.close()
-            return True
-        except ImportError:
-            log.info("Skipping Raw Gadget, as could not open /dev/raw-gadget .")
-            return False
-        except Exception:
-            log.exception("Raw Gadget check fail", exc_info=True, stack_info=True)
+        except Exception as e:
+            log.info(f"Skipping Raw Gadget, as could not open /dev/raw-gadget: {e}.")
             return False
 
+        rg.close()
+        return True
+
     def get_version(self):
-        """
-        Returns information about the active Facedancer version.
-        """
         raise NotImplementedError
 
     def connect(
@@ -124,14 +121,18 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
         Args:
             usb_device : The USBDevice object that represents the emulated device.
-            max_packet_size_ep0 : Max packet size for control endpoint.
+            max_packet_size_ep0 : Ignored
             device_speed : Requested usb speed for the Facedancer board.
         """
         if self.verbose > 0:
             log.info("connecting device: %s (%r)", usb_device.name, device_speed)
 
         self.connected_device = usb_device
-        self.device.run(speed=device_speed)
+        self.device.run(
+            udc_driver=os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower(),
+            udc_device=os.environ.get("RG_UDC_DEVICE", "dummy_udc.0").lower(),
+            speed=device_speed,
+        )
         self.control = ControlHandler(self)
 
     def disconnect(self):
@@ -152,16 +153,9 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
     def set_address(self, address: int, defer: bool = False):
         """
-        Sets the device address of the Facedancer. Usually only used during
-        initial configuration.
-
-        Args:
-            address : The address the Facedancer should assume.
-            defer   : True iff the set_address request should wait for an active transaction to
-                      finish.
+        Raw Gadget backend cannot receive a SET_ADDRESS request, as this
+        request is handled by the UDC driver.
         """
-        # Raw Gadget backend cannot receive a SET_ADDRESS request, as this
-        # request is handled by the UDC driver.
         raise NotImplementedError
 
     def configured(self, configuration):
@@ -187,10 +181,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
         """
-        Reads a block of data from the given endpoint.
-
-        Args:
-            endpoint_number : The number of the OUT endpoint on which data is to be rx'd.
+        Not used, since endpoints are always consumed internally.
         """
         raise NotImplementedError(
             "read_from_endpoint happens automatically in background"
@@ -512,12 +503,8 @@ class IOCTLRequest:
             req = IOCTLRequest.IOC(dir, typ, nr, size)
             if isinstance(arg, bytes):
                 arg = bytearray(arg)
-            try:
-                rv = fcntl.ioctl(fd, req, arg, True)
-            except OSError as e:
-                if e.errno == errno.ETIME:
-                    raise TimeoutError
-                raise
+
+            rv = fcntl.ioctl(fd, req, arg, True)
             return rv, arg
 
         return fn
@@ -543,10 +530,7 @@ class RawGadgetRequests(IOCTLRequest):
 
 
 class RawGadget:
-    def __init__(self, verbose=1):
-        self.udc_driver = os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower()
-        self.udc_device = os.environ.get("RG_UDC_DEVICE", "dummy_udc.0").lower()
-
+    def __init__(self, verbose):
         self.fd = None
         self.last_ep_addr = 0
         self.verbose = verbose
@@ -559,15 +543,15 @@ class RawGadget:
         self.fd.close()
         self.fd = None
 
-    def run(self, speed: DeviceSpeed):
-        if override := os.environ.get("RG_USB_SPEED"):
+    def run(self, udc_driver, udc_device, speed: DeviceSpeed):
+        if override := int(os.environ.get("RG_USB_SPEED", 0)):
             log.info(f"Overriding device speed with RG_USB_SPEED={override}")
             speed = DeviceSpeed(override)
 
         arg = usb_raw_init.build(
             {
-                "driver_name": self.udc_driver,
-                "device_name": self.udc_device,
+                "driver_name": udc_driver,
+                "device_name": udc_device,
                 "speed": speed,
             }
         )
@@ -576,10 +560,7 @@ class RawGadget:
 
     def event_fetch(self, data):
         arg = usb_raw_event.build({"kind": 0, "length": len(data), "data": data})
-        try:
-            _, data = RawGadgetRequests.USB_RAW_IOCTL_EVENT_FETCH(self.fd, arg)
-        except TimeoutError:
-            return None
+        _, data = RawGadgetRequests.USB_RAW_IOCTL_EVENT_FETCH(self.fd, arg)
 
         raw = usb_raw_event.parse(data)
         return RawGadgetEvent(raw.kind, raw.data)
@@ -588,19 +569,13 @@ class RawGadget:
         arg = usb_raw_ep_io.build(
             {"ep": 0, "flags": flags, "length": len(data), "data": data}
         )
-        try:
-            RawGadgetRequests.USB_RAW_IOCTL_EP0_WRITE(self.fd, arg)
-        except TimeoutError:
-            pass
+        RawGadgetRequests.USB_RAW_IOCTL_EP0_WRITE(self.fd, arg)
 
     def ep0_read(self, data, flags=0):
         arg = usb_raw_ep_io.build(
             {"ep": 0, "flags": flags, "length": len(data), "data": data}
         )
-        try:
-            rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP0_READ(self.fd, arg)
-        except TimeoutError:
-            return None, None
+        rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP0_READ(self.fd, arg)
 
         return rv, usb_raw_ep_io.parse(data)
 
@@ -617,12 +592,7 @@ class RawGadget:
         arg = usb_raw_ep_io.build(
             {"ep": handle, "flags": flags, "length": len(data), "data": data}
         )
-        try:
-            rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
-        except TimeoutError:
-            log.warning(f"Timeout: ep_write {handle} {data.hex()}")
-            return
-
+        rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
         if rv != len(data):
             log.warning(f"ep_write {handle=} length={len(data)} {rv=}")
 
@@ -802,7 +772,7 @@ class EndpointInHandler(EndpointHandler):
     def _receiver(self):
         """Read data from device.
 
-        The proxy will call backend.send_on_endpoint()
+        The emulated device will call backend.send_on_endpoint()
         which will call self.send().
         """
         while not self.stopped:
