@@ -12,7 +12,6 @@ Authors:
 from __future__ import annotations
 
 from dataclasses import dataclass
-import errno
 import fcntl
 import os
 from threading import Thread
@@ -59,6 +58,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     connected_device: USBDevice
     queue: Queue
     eps: dict[int, EndpointHandler]
+    control: ControlHandler
 
     def __init__(
         self,
@@ -128,7 +128,11 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             log.info("connecting device: %s (%r)", usb_device.name, device_speed)
 
         self.connected_device = usb_device
-        self.device.run(speed=device_speed)
+        self.device.run(
+            udc_driver=os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower(),
+            udc_device=os.environ.get("RG_UDC_DEVICE", "dummy_udc.0").lower(),
+            speed=device_speed,
+        )
         self.control = ControlHandler(self)
 
     def disconnect(self):
@@ -499,12 +503,8 @@ class IOCTLRequest:
             req = IOCTLRequest.IOC(dir, typ, nr, size)
             if isinstance(arg, bytes):
                 arg = bytearray(arg)
-            try:
-                rv = fcntl.ioctl(fd, req, arg, True)
-            except OSError as e:
-                if e.errno == errno.ETIME:
-                    raise TimeoutError
-                raise
+
+            rv = fcntl.ioctl(fd, req, arg, True)
             return rv, arg
 
         return fn
@@ -530,10 +530,7 @@ class RawGadgetRequests(IOCTLRequest):
 
 
 class RawGadget:
-    def __init__(self, verbose=1):
-        self.udc_driver = os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower()
-        self.udc_device = os.environ.get("RG_UDC_DEVICE", "dummy_udc.0").lower()
-
+    def __init__(self, verbose):
         self.fd = None
         self.last_ep_addr = 0
         self.verbose = verbose
@@ -546,15 +543,15 @@ class RawGadget:
         self.fd.close()
         self.fd = None
 
-    def run(self, speed: DeviceSpeed):
-        if override := os.environ.get("RG_USB_SPEED"):
+    def run(self, udc_driver, udc_device, speed: DeviceSpeed):
+        if override := int(os.environ.get("RG_USB_SPEED", 0)):
             log.info(f"Overriding device speed with RG_USB_SPEED={override}")
             speed = DeviceSpeed(override)
 
         arg = usb_raw_init.build(
             {
-                "driver_name": self.udc_driver,
-                "device_name": self.udc_device,
+                "driver_name": udc_driver,
+                "device_name": udc_device,
                 "speed": speed,
             }
         )
@@ -563,10 +560,7 @@ class RawGadget:
 
     def event_fetch(self, data):
         arg = usb_raw_event.build({"kind": 0, "length": len(data), "data": data})
-        try:
-            _, data = RawGadgetRequests.USB_RAW_IOCTL_EVENT_FETCH(self.fd, arg)
-        except TimeoutError:
-            return None
+        _, data = RawGadgetRequests.USB_RAW_IOCTL_EVENT_FETCH(self.fd, arg)
 
         raw = usb_raw_event.parse(data)
         return RawGadgetEvent(raw.kind, raw.data)
@@ -575,19 +569,13 @@ class RawGadget:
         arg = usb_raw_ep_io.build(
             {"ep": 0, "flags": flags, "length": len(data), "data": data}
         )
-        try:
-            RawGadgetRequests.USB_RAW_IOCTL_EP0_WRITE(self.fd, arg)
-        except TimeoutError:
-            pass
+        RawGadgetRequests.USB_RAW_IOCTL_EP0_WRITE(self.fd, arg)
 
     def ep0_read(self, data, flags=0):
         arg = usb_raw_ep_io.build(
             {"ep": 0, "flags": flags, "length": len(data), "data": data}
         )
-        try:
-            rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP0_READ(self.fd, arg)
-        except TimeoutError:
-            return None, None
+        rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP0_READ(self.fd, arg)
 
         return rv, usb_raw_ep_io.parse(data)
 
@@ -604,12 +592,7 @@ class RawGadget:
         arg = usb_raw_ep_io.build(
             {"ep": handle, "flags": flags, "length": len(data), "data": data}
         )
-        try:
-            rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
-        except TimeoutError:
-            log.warning(f"Timeout: ep_write {handle} {data.hex()}")
-            return
-
+        rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
         if rv != len(data):
             log.warning(f"ep_write {handle=} length={len(data)} {rv=}")
 
@@ -789,7 +772,7 @@ class EndpointInHandler(EndpointHandler):
     def _receiver(self):
         """Read data from device.
 
-        The proxy will call backend.send_on_endpoint()
+        The emulated device will call backend.send_on_endpoint()
         which will call self.send().
         """
         while not self.stopped:
