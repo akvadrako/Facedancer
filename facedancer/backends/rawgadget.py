@@ -1,11 +1,13 @@
-# Raw Gadget-based Facedancer backend.
-#
-# See https://github.com/xairy/raw-gadget for details about Raw Gadget.
-#
-# Authors:
-#   Andrey Konovalov <andreyknvl@gmail.com>
-#   Kirill Zhirovsky <me@kirill9617.win>
-#   Devin Bayer <dev@doubly.so>
+"""
+Raw Gadget-based Facedancer backend.
+
+See https://github.com/xairy/raw-gadget for details about Raw Gadget.
+
+Authors:
+- Andrey Konovalov <andreyknvl@gmail.com>
+- Kirill Zhirovsky <me@kirill9617.win>
+- Devin Bayer <dev@doubly.so>
+"""
 
 from __future__ import annotations
 
@@ -70,7 +72,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             device  : The device that will act as our UDC.          (Optional)
             verbose : The verbosity level of the given application. (Optional)
-            quirks  : List of USB platform quirks.                  (Optional)
+            quirks  : Unused
         """
         super().__init__(device or RawGadget(verbose), verbose)
 
@@ -97,19 +99,14 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
         try:
             rg = open("/dev/raw-gadget")
-            rg.close()
-            return True
-        except ImportError:
-            log.info("Skipping Raw Gadget, as could not open /dev/raw-gadget .")
-            return False
-        except Exception:
-            log.exception("Raw Gadget check fail", exc_info=True, stack_info=True)
+        except Exception as e:
+            log.info(f"Skipping Raw Gadget, as could not open /dev/raw-gadget: {e}.")
             return False
 
+        rg.close()
+        return True
+
     def get_version(self):
-        """
-        Returns information about the active Facedancer version.
-        """
         raise NotImplementedError
 
     def connect(
@@ -124,7 +121,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
         Args:
             usb_device : The USBDevice object that represents the emulated device.
-            max_packet_size_ep0 : Max packet size for control endpoint.
+            max_packet_size_ep0 : Ignored
             device_speed : Requested usb speed for the Facedancer board.
         """
         if self.verbose > 0:
@@ -152,16 +149,9 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
     def set_address(self, address: int, defer: bool = False):
         """
-        Sets the device address of the Facedancer. Usually only used during
-        initial configuration.
-
-        Args:
-            address : The address the Facedancer should assume.
-            defer   : True iff the set_address request should wait for an active transaction to
-                      finish.
+        Raw Gadget backend cannot receive a SET_ADDRESS request, as this
+        request is handled by the UDC driver.
         """
-        # Raw Gadget backend cannot receive a SET_ADDRESS request, as this
-        # request is handled by the UDC driver.
         raise NotImplementedError
 
     def configured(self, configuration):
@@ -187,10 +177,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
         """
-        Reads a block of data from the given endpoint.
-
-        Args:
-            endpoint_number : The number of the OUT endpoint on which data is to be rx'd.
+        Not used, since endpoints are always consumed internally.
         """
         raise NotImplementedError(
             "read_from_endpoint happens automatically in background"
