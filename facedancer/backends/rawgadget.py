@@ -183,7 +183,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.configuration = configuration
         self.is_configured = True
 
-        # TODO: Endpoint threads need to be spawned before the SET_CONFIGURATION request is acked
+        # TODO: Double check that endpoint threads need to be spawned before the SET_CONFIGURATION request is acked
         self._enable()
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
@@ -212,12 +212,13 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             # workaround an unclear API
             # see https://github.com/greatscottgadgets/facedancer/issues/163
             if self.last_control_direction == USBDirection.OUT:
-                log.debug("ignoring send_on_endpoint for OUT control requests")
-                return
-
-            if self.verbose > 2:
-                log.info(f"send ep0 {data.hex(' ', -2)}")
-            self.control.send(data)
+                if self.last_control_acked:
+                    log.debug("ignoring send_on_endpoint for already acked OUT request")
+                else:
+                    self.last_control_acked = True
+                    self.control.read(0)
+            else:
+                self.control.send(data)
         else:
             if self.verbose > 4:
                 log.debug(f"send ep{endpoint_number} len={len(data)} {blocking=}")
@@ -233,12 +234,10 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         blocking: bool = False,
     ):
         """
-        This does nothing. It's only called by the proxy and only for OUT requests,
-        which are implicitly "acked" by the ep_read call needed to fetch the data.
-
-        And IN requests use send_on_control_endpoint to pass data.
+        This is only called by the proxy and only for OUT requests. Other acks
+        call send_on_control_endpoint.
         """
-        pass
+        self.send_on_endpoint(0, b"", blocking)
 
     def stall_endpoint(
         self, endpoint_number: int, direction: USBDirection = USBDirection.OUT
@@ -320,9 +319,11 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             log.debug(f"recv control {req}")
 
         self.last_control_direction = USBDirection(req.get_direction())
+        self.last_control_acked = False
 
-        if req.direction == USBDirection.OUT:
+        if req.direction == USBDirection.OUT and req.length > 0:
             rv, ep_request = self.control.read(req.length)
+            self.last_control_acked = True
             assert ep_request and rv == req.length
             req.data = bytes(ep_request.data)
             if self.verbose > 3:
@@ -659,9 +660,13 @@ class ControlHandler:
         self._thread.join()
 
     def read(self, length: int):
+        if self.backend.verbose > 2:
+            log.info(f"read ep0 {length=}")
         return self.backend.device.ep0_read(bytearray(length))
 
     def send(self, data: bytes):
+        if self.backend.verbose > 2:
+            log.info(f"send ep0 {data.hex(' ', -2)}")
         self.backend.device.ep0_write(data)
 
     def _gadget_loop(self):
