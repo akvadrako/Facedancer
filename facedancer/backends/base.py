@@ -95,7 +95,7 @@ class FacedancerBackend:
 
     def send_on_control_endpoint(self, endpoint_number: int, in_request: USBControlRequest, data: bytes, blocking: bool=True):
         """
-        Sends a collection of USB data in response to a IN control request by the host.
+        Sends a collection of USB data in response to a control request by the host.
 
         Args:
             endpoint_number  : The number of the IN endpoint on which data should be sent.
