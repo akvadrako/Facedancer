@@ -183,7 +183,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.configuration = configuration
         self.is_configured = True
 
-        # TODO: Endpoint threads need to be spawned before the SET_CONFIGURATION request is acked
+        # TODO: Double check that endpoint threads need to be spawned before the SET_CONFIGURATION request is acked
         self._enable()
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
@@ -193,6 +193,31 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         raise NotImplementedError(
             "read_from_endpoint happens automatically in background"
         )
+        
+    def send_on_control_endpoint(self, endpoint_number: int, in_request: USBControlRequest, data: bytes, blocking: bool=True):
+        """
+        Sends a collection of USB data in response to a control request by the host.
+
+        Args:
+            endpoint_number  : The number of the IN endpoint on which data should be sent.
+            in_request       : The control request being responded to.
+            data             : The data to be sent.
+            blocking         : If true, this function should wait for the transfer to complete.
+        """
+        assert endpoint_number == 0, "control requests only supported for ep 0"
+
+        if in_request.direction == USBDirection.OUT:
+            if not self.unacked_request:
+                log.debug("ignoring send_on_endpoint for already acked OUT request")
+                return
+
+            assert not data, "cannot send data to ep0_read()"
+            self.control.read(0)
+        else:
+            self.control.send(data)
+        
+        if self.unacked_request is in_request:
+            self.unacked_request = None
 
     def send_on_endpoint(
         self, endpoint_number: int, data: bytes, blocking: bool = True
@@ -208,23 +233,14 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError(f" {type(data)=}, must be bytes")
 
-        if endpoint_number == 0:
-            # workaround an unclear API
-            # see https://github.com/greatscottgadgets/facedancer/issues/163
-            if self.last_control_direction == USBDirection.OUT:
-                log.debug("ignoring send_on_endpoint for OUT control requests")
-                return
+        assert endpoint_number != 0, "send_on_endpoint called for control endpoint"
 
-            if self.verbose > 2:
-                log.info(f"send ep0 {data.hex(' ', -2)}")
-            self.control.send(data)
-        else:
-            if self.verbose > 4:
-                log.debug(f"send ep{endpoint_number} len={len(data)} {blocking=}")
-            address = USBEndpoint.address_for_number(endpoint_number, USBDirection.IN)
-            handler = self.eps[address]
-            assert isinstance(handler, EndpointInHandler)
-            handler.send(data, blocking)
+        if self.verbose > 4:
+            log.debug(f"send ep{endpoint_number} len={len(data)} {blocking=}")
+        address = USBEndpoint.address_for_number(endpoint_number, USBDirection.IN)
+        handler = self.eps[address]
+        assert isinstance(handler, EndpointInHandler)
+        handler.send(data, blocking)
 
     def ack_status_stage(
         self,
@@ -233,12 +249,15 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         blocking: bool = False,
     ):
         """
-        This does nothing. It's only called by the proxy and only for OUT requests,
-        which are implicitly "acked" by the ep_read call needed to fetch the data.
-
-        And IN requests use send_on_control_endpoint to pass data.
+        This is only called by the proxy and only for OUT requests.
+        Other acks call send_on_control_endpoint.
         """
-        pass
+        if not self.unacked_request:
+            log.debug("ignoring ack_status_stage for already acked OUT request")
+            return
+
+        assert direction == USBDirection.OUT
+        self.send_on_control_endpoint(0, self.unacked_request, b"", blocking)
 
     def stall_endpoint(
         self, endpoint_number: int, direction: USBDirection = USBDirection.OUT
@@ -315,18 +334,19 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
     def _recv_control(self, data: bytes):
         req: USBControlRequest = self.connected_device.create_request(data)
-
+        
         if self.verbose > 2:
             log.debug(f"recv control {req}")
 
-        self.last_control_direction = USBDirection(req.get_direction())
-
-        if req.direction == USBDirection.OUT:
+        if req.direction == USBDirection.OUT and req.length > 0:
             rv, ep_request = self.control.read(req.length)
+            self.unacked_request = None
             assert ep_request and rv == req.length
             req.data = bytes(ep_request.data)
             if self.verbose > 3:
                 log.debug(f"  data {data.hex(' ', -2)}")
+        else:
+            self.unacked_request = req
 
         reenable = False
         if (
@@ -659,9 +679,13 @@ class ControlHandler:
         self._thread.join()
 
     def read(self, length: int):
+        if self.backend.verbose > 2:
+            log.info(f"read ep0 {length=}")
         return self.backend.device.ep0_read(bytearray(length))
 
     def send(self, data: bytes):
+        if self.backend.verbose > 2:
+            log.info(f"send ep0 {data.hex(' ', -2)}")
         self.backend.device.ep0_write(data)
 
     def _gadget_loop(self):
