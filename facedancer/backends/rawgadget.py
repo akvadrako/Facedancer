@@ -57,7 +57,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     device: RawGadget
     connected_device: USBDevice
     queue: Queue
-    eps: dict[int, EndpointHandler]
+    eps: dict[int, EndpointHandler]  # address -> handler
     control: ControlHandler
 
     def __init__(
@@ -127,6 +127,9 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         if self.verbose > 0:
             log.info("connecting device: %s (%r)", usb_device.name, device_speed)
 
+        # use SIGUSR1 to interrupt waiting for ioctl to /dev/raw-gadget
+        self._old_signal_handler = signal(SIGUSR1, self._ignore_signal)
+
         self.connected_device = usb_device
         self.device.run(
             udc_driver=os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower(),
@@ -141,6 +144,9 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self._disable()
         self.control.stop()
         self.device.close()
+
+        # use SIGUSR1 to interrupt waiting for ioctl to /dev/raw-gadget
+        signal(SIGUSR1, self._old_signal_handler)
 
         if self.verbose > 0:
             log.info("disconnected device: %s", self.connected_device.name)
@@ -177,6 +183,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.configuration = configuration
         self.is_configured = True
 
+        # TODO: Endpoint threads need to be spawned before the SET_CONFIGURATION request is acked
         self._enable()
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
@@ -196,7 +203,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             endpoint_number : The number of the IN endpoint on which data should be sent.
             data : The data to be sent.
-            blocking : This must always be true.
+            blocking : Wait for sending. Must be true for control.
         """
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError(f" {type(data)=}, must be bytes")
@@ -213,9 +220,10 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 )
             self.control.send(data, self.last_control_direction)
         else:
-            handler = self.eps[endpoint_number]
+            address = USBEndpoint.address_for_number(endpoint_number, USBDirection.IN)
+            handler = self.eps[address]
             assert isinstance(handler, EndpointInHandler)
-            handler.send(data)
+            handler.send(data, blocking)
 
     def ack_status_stage(
         self,
@@ -363,18 +371,23 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         if not self.is_configured:
             return
 
-        for interface in self.configuration.get_interfaces():
+        for interface in self.configuration.active_interfaces.values():
             for ep in interface.get_endpoints():
                 if ep.direction == USBDirection.IN:
-                    self.eps[ep.number] = EndpointInHandler(ep, self)
+                    self.eps[ep.address] = EndpointInHandler(ep, self)
                 else:
-                    self.eps[ep.number] = EndpointOutHandler(ep, self)
+                    self.eps[ep.address] = EndpointOutHandler(ep, self)
+
+                self.eps[ep.address].start()
 
     def _disable(self):
         for ep in self.eps.values():
             ep.stop()
 
         self.eps = {}
+
+    def _ignore_signal(self, signum, _frame):
+        log.debug(f"ignoring signal {signum}")
 
 
 class TrailingBytes(Bytes):
@@ -643,20 +656,12 @@ class EpReadEvent:
     data: bytes
 
 
-def _ignore(signum, _frame):
-    log.debug(f"ignoring {signum}")
-
-
 class ControlHandler:
     """Send and receive raw gadget control events that can block."""
 
     def __init__(self, backend):
         self.backend = backend
         self.stopped = False
-
-        # use SIGUSR1 to interrupt waiting for control events
-        signal(SIGUSR1, _ignore)
-
         self._thread = Thread(target=self._receiver, name="ctrl-recv", daemon=True)
         self._thread.start()
 
@@ -701,13 +706,23 @@ class EndpointHandler:
         self.ep = ep
         self.backend = backend
         self.stopped = False
+        self._thread = Thread(
+            target=self._gadget_thread, name=f"ep-{self.ep.number}", daemon=True
+        )
 
         self._handle = self.backend.device.ep_enable(ep.get_descriptor())
         log.debug(f"enable {ep} ({ep.address}) handle={self._handle}")
 
+    def _gadget_thread(self): ...
+
+    def start(self):
+        self._thread.start()
+
     def stop(self):
         log.debug(f"ep-{self.ep.number} stopping")
         self.stopped = True
+        pthread_kill(self._thread.ident, SIGUSR1)
+        self._thread.join()
         try:
             self.backend.device.ep_disable(self._handle)
         except Exception as e:
@@ -717,18 +732,7 @@ class EndpointHandler:
 class EndpointOutHandler(EndpointHandler):
     """Read OUT transfers from the host and report them to the core Facedancer code."""
 
-    def __init__(self, ep, backend):
-        super().__init__(ep, backend)
-        self._thread = Thread(
-            target=self._receiver, name=f"ep-{self.ep.number}", daemon=True
-        )
-        self._thread.start()
-
-    def stop(self):
-        super().stop()
-        self._thread.join()
-
-    def _receiver(self):
+    def _gadget_thread(self):
         while not self.stopped:
             try:
                 data = self.backend.device.ep_read(
@@ -750,24 +754,38 @@ INTERVAL_MIN_MS = 100
 class EndpointInHandler(EndpointHandler):
     """Read IN transfers from the core Facedancer code and send to the host."""
 
-    def __init__(self, ep, backend):
-        super().__init__(ep, backend)
-
-        self._thread = Thread(
-            target=self._receiver,
-            name=f"ep-{self.ep.number}-recv",
-            daemon=True,
+    def start(self):
+        self._queue = Queue()
+        self._recv_thread = Thread(
+            target=self._receiver, name=f"ep-{self.ep.number}", daemon=True
         )
-        self._thread.start()
+        self._recv_thread.start()
+        super().start()
 
     def stop(self):
         super().stop()
-        self._thread.join()
+        self._recv_thread.join()
 
-    def send(self, data):
-        if self.backend.verbose > 3:
-            log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
-        self.backend.device.ep_write(self._handle, data)
+    def send(self, data: bytes, blocking: bool):
+        self._queue.put(data)
+        if blocking:
+            self._queue.join()
+
+    def _gadget_thread(self):
+        while not self.stopped:
+            try:
+                data = self._queue.get()
+                if self.stopped:
+                    break
+
+                if self.backend.verbose > 3:
+                    log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
+                self.backend.device.ep_write(self._handle, data)
+                self._queue.task_done()
+            except BrokenPipeError:
+                continue
+
+        log.debug(f"ep-{self.ep.number}-gadget stopped")
 
     def _receiver(self):
         """Read data from device.
